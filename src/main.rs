@@ -1,28 +1,29 @@
+use anyhow::Result;
 use axum::{
     extract::State,
     http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
-use anyhow::{Context, Result};
-use ndarray::{Array1, Axis};
+use log::{error, info, warn};
+use ort::{inputs, session::Session, value::Tensor};
+use reqwest;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{BufRead, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tracing::{info, warn, error};
+use tokenizers::Tokenizer;
 
 // --- CONFIGURATION ---
-// Ces variables peuvent être surchargées par des ENV VAR pour le déploiement
 const DEFAULT_DOC_FOLDER: &str = "./docs";
 const DEFAULT_INDEX_FILE: &str = "rag_index.json";
-const DEFAULT_LLM_MODEL: &str = "./models/phi-3-mini-4k-instruct.Q4_K_M.gguf";
 const DEFAULT_EMBED_MODEL: &str = "./models/all-MiniLM-L6-v2.onnx";
+const DEFAULT_TOKENIZER: &str = "./models/tokenizer.json";
 const DEFAULT_PORT: &str = "8080";
-
-const CHUNK_SIZE: usize = 400; // Un peu plus grand pour de meilleures réponses
+const LLAMAFILE_URL: &str = "http://localhost:8081";
+const CHUNK_SIZE: usize = 400;
+const MAX_LENGTH: usize = 128;
 
 // --- STRUCTURES API ---
 #[derive(Serialize, Deserialize)]
@@ -40,14 +41,14 @@ struct QueryResponse {
 #[derive(Serialize, Deserialize)]
 struct ReindexResponse {
     status: String,
-    message:String,
+    message: String,
     source: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct HealthResponse {
     status: String,
-    message:String,
+    message: String,
     source: Vec<String>,
 }
 
@@ -68,73 +69,65 @@ struct IndexStore {
 
 // --- ÉTAT PARTAGÉ (STATE) ---
 struct AppState {
-    engines: Mutex<Engines>,
+    client: reqwest::Client,
+    ort_session: Mutex<Session>,
+    tokenizer: Arc<Tokenizer>,
     index: Mutex<IndexStore>,
     doc_folder: PathBuf,
     index_file: String,
 }
 
-struct Engines {
-    llama: llama_cpp_rs::LlamaContext,
-    ort_session: ort::Session,
+// --- FONCTIONS EMBEDDING ---
+fn embed(ort_session: &mut Session, tokenizer: &Tokenizer, text: &str) -> Result<Vec<f32>> {
+    // 1. Tokenisation
+    let encoding = tokenizer
+        .encode(text, true)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let mut ids = encoding.get_ids().to_vec();
+    let mut mask = encoding.get_attention_mask().to_vec();
+
+    // 2. Padding / Truncation pour correspondre au modèle (128 tokens)
+    if ids.len() > MAX_LENGTH {
+        ids.truncate(MAX_LENGTH);
+        mask.truncate(MAX_LENGTH);
+    }
+    while ids.len() < MAX_LENGTH {
+        ids.push(0);
+        mask.push(0);
+    }
+
+    // 3. Création des tenseurs ONNX (i64 pour les token IDs)
+    // // token_type_ids = tous à 0 pour une phrase simple
+    let token_types = vec![0i64; MAX_LENGTH];
+    let ids_i64: Vec<i64> = ids.iter().map(|&x| x as i64).collect();
+    let mask_i64: Vec<i64> = mask.iter().map(|&x| x as i64).collect();
+    let ids_tensor = Tensor::from_array(([1, MAX_LENGTH], ids_i64.into_boxed_slice()))
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mask_tensor = Tensor::from_array(([1, MAX_LENGTH], mask_i64.into_boxed_slice()))
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let types_tensor = Tensor::from_array(([1, MAX_LENGTH], token_types.into_boxed_slice()))
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    // 4. Exécution
+    let inputs = inputs![
+        "input_ids" => ids_tensor,
+        "attention_mask" => mask_tensor,
+        "token_type_ids" => types_tensor,
+    ];
+
+    let outputs = ort_session
+        .run(inputs)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let (_, output) = outputs[0]
+        .try_extract_tensor::<f32>()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    // 5. Extraction du vecteur (pooling mean simplifié : on prend la première sortie)
+    // all-MiniLM-L6-v2 retourne [1, 384] après pooling
+    Ok(output.to_vec())
 }
 
-impl Engines {
-    fn new(llm_path: &str, embed_path: &str) -> Result<Self> {
-        info!("Chargement du modèle LLM...");
-        let model_params = llama_cpp_rs::ModelParams::default();
-        let ctx_params = llama_cpp_rs::ContextParams::new()
-            .with_n_ctx(2048)
-            .with_seed(1234);
-            
-        let model = llama_cpp_rs::LlamaModel::load_from_file(llm_path, model_params)
-            .context("Erreur chargement modèle LLM")?;
-        let llama = model.new_context(ctx_params)
-            .context("Erreur création contexte LLM")?;
-
-        info!("Chargement du modèle Embedding...");
-        let ort_session = ort::Session::builder()?
-            .with_intra_threads(2)?
-            .commit_from_file(embed_path)?;
-
-        Ok(Self { llama, ort_session })
-    }
-
-    fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let inputs = ort::inputs![text]?;
-        let outputs = self.ort_session.run(inputs)?;
-        let output = outputs[0].try_extract_tensor::<f32>()?;
-        Ok(output.view().as_slice().unwrap().to_vec())
-    }
-
-    fn generate(&mut self, prompt: &str) -> Result<String> {
-        let mut sampler = llama_cpp_rs::Sampler::new()
-            .with_temp(0.3)
-            .with_top_p(0.9);
-        
-        let mut output = String::new();
-        let tokens = self.llama.model().tokenize(prompt, true)?;
-        let mut n_past = 0;
-        let max_tokens = 512; 
-
-        for &token in tokens.iter() {
-            self.llama.eval(&[token], &mut n_past)?;
-        }
-
-        for _ in 0..max_tokens {
-            let token = self.llama.sample(&mut sampler, n_past)?;
-            if token == self.llama.model().token_eos() {
-                break;
-            }
-            let text = self.llama.model().token_to_str(token)?;
-            output.push_str(&text);
-            self.llama.eval(&[token], &mut n_past)?;
-        }
-        Ok(output)
-    }
-}
-
-// --- FONCTIONS UTILITAIRES ---
+// --- UTILITAIRES ---
 fn simple_hash(s: &str) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -169,14 +162,13 @@ fn save_index(store: &IndexStore, path: &str) {
 }
 
 fn extract_text(path: &Path) -> Result<String> {
-    // Markdown uniquement pour cette version
     Ok(fs::read_to_string(path)?)
 }
 
-fn chunk_text(text: &str, path: &str) -> Vec<String> {
+fn chunk_text(text: &str) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut current = String::new();
-    
+
     for word in text.split_whitespace() {
         if current.len() + word.len() > CHUNK_SIZE {
             if !current.is_empty() {
@@ -184,11 +176,15 @@ fn chunk_text(text: &str, path: &str) -> Vec<String> {
             }
             current = word.to_string();
         } else {
-            if !current.is_empty() { current.push(' '); }
+            if !current.is_empty() {
+                current.push(' ');
+            }
             current.push_str(word);
         }
     }
-    if !current.is_empty() { chunks.push(current); }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
     chunks
 }
 
@@ -196,27 +192,36 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 { return 0.0; }
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
     dot / (norm_a * norm_b)
 }
 
 fn search_index(store: &IndexStore, query_emb: &[f32], top_k: usize) -> Vec<(String, f32)> {
-    let mut scores: Vec<(usize, f32)> = store.chunks
+    let mut scores: Vec<(usize, f32)> = store
+        .chunks
         .iter()
         .enumerate()
         .map(|(i, chunk)| (i, cosine_similarity(query_emb, &chunk.embedding)))
         .collect();
-    
+
     scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     scores.truncate(top_k);
-    
-    scores.iter()
-        .filter(|(_, score)| *score > 0.3) // Seuil de pertinence minimum
+
+    scores
+        .iter()
+        .filter(|(_, score)| *score > 0.3)
         .map(|(i, score)| (store.chunks[*i].content.clone(), *score))
         .collect()
 }
 
-fn process_file(path: &Path, engines: &mut Engines, store: &mut IndexStore) {
+fn process_file(
+    path: &Path,
+    ort_session: &mut Session,
+    tokenizer: &Tokenizer,
+    store: &mut IndexStore,
+) {
     let path_str = path.to_string_lossy().to_string();
     let content = match extract_text(path) {
         Ok(c) => c,
@@ -225,19 +230,24 @@ fn process_file(path: &Path, engines: &mut Engines, store: &mut IndexStore) {
             return;
         }
     };
-    
+
     let hash = simple_hash(&content);
-    
+
     if store.processed_files.get(&path_str) == Some(&hash) {
         return;
     }
 
-    info!("Indexation: {}", path.file_name().unwrap().to_string_lossy());
-    let chunks = chunk_text(&content, &path_str);
-    
+    info!(
+        "Indexation: {}",
+        path.file_name().unwrap().to_string_lossy()
+    );
+    let chunks = chunk_text(&content);
+
     for chunk in chunks {
-        if chunk.len() < 20 { continue; }
-        match engines.embed(&chunk) {
+        if chunk.len() < 20 {
+            continue;
+        }
+        match embed(ort_session, tokenizer, &chunk) {
             Ok(emb) => {
                 store.chunks.push(Chunk {
                     path: path_str.clone(),
@@ -254,31 +264,45 @@ fn process_file(path: &Path, engines: &mut Engines, store: &mut IndexStore) {
 
 fn reindex_all(state: &AppState) -> Vec<String> {
     let mut store = state.index.lock().unwrap();
-    let mut engines = state.engines.lock().unwrap();
+    let mut ort_session = state.ort_session.lock().unwrap();
     let mut indexed_files = Vec::new();
-    
+
     for entry in walkdir::WalkDir::new(&state.doc_folder)
         .into_iter()
-        .filter_map(|e| e.ok()) 
+        .filter_map(|e| e.ok())
     {
         if entry.file_type().is_file() {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("md") {
-                process_file(path, &mut engines, &mut store);
+                process_file(path, &mut ort_session, &state.tokenizer, &mut store);
                 indexed_files.push(path.to_string_lossy().to_string());
             }
         }
     }
-    
+
     save_index(&store, &state.index_file);
     indexed_files
 }
 
 // --- HANDLERS HTTP ---
-async fn health_check() -> Json<HealthResponse> {
+async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    let llama_status = state
+        .client
+        .get(format!("{}/health", LLAMAFILE_URL))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+
+    let message = if llama_status {
+        "Server and LLM ready"
+    } else {
+        "Server ready, LLM unreachable"
+    };
+
     Json(HealthResponse {
         status: "ok".to_string(),
-        message:"Server is running".to_string(),
+        message: message.to_string(),
         source: vec![],
     })
 }
@@ -287,53 +311,82 @@ async fn query(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, StatusCode> {
-    let mut engines = state.engines.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let store = state.index.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
-    // Embedding question
-    let q_emb = engines.embed(&payload.question)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
-    // Recherche
-    let results = search_index(&store, &q_emb, 3);
-    
-    if results.is_empty() {
-        return Ok(Json(QueryResponse {
-            status: "no_context".to_string(),
-             data:"Aucun document pertinent trouvé dans la base de connaissances.".to_string(),
-            source: vec![],
-        }));
-    }
-    
-    let sources: Vec<String> = results.iter().map(|(_, s)| format!("Score: {:.2}", s)).collect();
-    let context_str: String = results.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>().join("\n---\n");
-    
-    // Génération réponse
+    let (sources, context_str) = {
+        let store = state
+            .index
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let q_emb = {
+            let mut ort_session = state
+                .ort_session
+                .lock()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            embed(&mut ort_session, &state.tokenizer, &payload.question)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        };
+        let results = search_index(&store, &q_emb, 3);
+
+        if results.is_empty() {
+            return Ok(Json(QueryResponse {
+                status: "no_context".to_string(),
+                data: "Aucun document pertinent trouvé dans la base de connaissances.".to_string(),
+                source: vec![],
+            }));
+        }
+
+        let sources: Vec<String> = results
+            .iter()
+            .map(|(_, s)| format!("Score: {:.2}", s))
+            .collect();
+        let context_str: String = results
+            .iter()
+            .map(|(c, _)| c.clone())
+            .collect::<Vec<_>>()
+            .join("\n---\n");
+        (sources, context_str)
+    };
+
     let prompt = format!(
         "Tu es un assistant technique professionnel. Réponds en français de manière concise en te basant UNIQUEMENT sur le CONTEXTE ci-dessous.\n\nCONTEXTE:\n{}\n\nQUESTION:\n{}\n\nRÉPONSE:",
         context_str, payload.question
     );
-    
-    let answer = engines.generate(&prompt)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
+    let answer = match reqwest::Client::new()
+        .post(format!("{}/completion", LLAMAFILE_URL))
+        .json(&serde_json::json!({
+            "prompt": prompt,
+            "n_predict": 512,
+            "temperature": 0.3,
+            "top_p": 0.9
+        }))
+        .send()
+        .await
+    {
+        Ok(response) => match response.json::<serde_json::Value>().await {
+            Ok(json) => json["content"]
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "Erreur de génération".to_string()),
+            Err(_) => "Erreur de génération".to_string(),
+        },
+        Err(_) => "Erreur de génération".to_string(),
+    };
+
     Ok(Json(QueryResponse {
         status: "success".to_string(),
-         data:answer,
+        data: answer,
         source: sources,
     }))
 }
 
-async fn reindex(
-    State(state): State<Arc<AppState>>,
-) -> Json<ReindexResponse> {
+async fn reindex(State(state): State<Arc<AppState>>) -> Json<ReindexResponse> {
     info!("Réindexation demandée...");
     let files = reindex_all(&state);
     info!("Réindexation terminée. {} fichiers traités.", files.len());
-    
+
     Json(ReindexResponse {
         status: "success".to_string(),
-         message: format!("{} documents indexés", files.len()),
+        message: format!("{} documents indexés", files.len()),
         source: files,
     })
 }
@@ -341,55 +394,61 @@ async fn reindex(
 // --- MAIN ---
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialisation logs
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("rag_api_server=info".parse().unwrap())
-        )
-        .init();
+    env_logger::init();
 
-    // Configuration depuis ENV ou défauts
     let doc_folder = std::env::var("DOC_FOLDER").unwrap_or_else(|_| DEFAULT_DOC_FOLDER.to_string());
     let index_file = std::env::var("INDEX_FILE").unwrap_or_else(|_| DEFAULT_INDEX_FILE.to_string());
-    let llm_model = std::env::var("LLM_MODEL").unwrap_or_else(|_| DEFAULT_LLM_MODEL.to_string());
-    let embed_model = std::env::var("EMBED_MODEL").unwrap_or_else(|_| DEFAULT_EMBED_MODEL.to_string());
+    let embed_model =
+        std::env::var("EMBED_MODEL").unwrap_or_else(|_| DEFAULT_EMBED_MODEL.to_string());
+    let tokenizer_file =
+        std::env::var("TOKENIZER").unwrap_or_else(|_| DEFAULT_TOKENIZER.to_string());
     let port = std::env::var("PORT").unwrap_or_else(|_| DEFAULT_PORT.to_string());
 
     info!("Démarrage du serveur RAG API...");
-    info!("Dossier documents: {}", doc_folder);
-    info!("Port HTTP: {}", port);
+    info!("Dossier documents: {}", &doc_folder);
+    info!("Port HTTP: {}", &port);
 
-    // Initialisation moteurs
-    let engines = Engines::new(&llm_model, &embed_model)
-        .context("Échec initialisation moteurs")?;
-    
-    // Chargement index
+    // Session ONNX
+    let ort_session = Session::builder()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .with_intra_threads(2)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .commit_from_file(&embed_model)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    // Tokenizer
+    let tokenizer = Arc::new(
+        Tokenizer::from_file(&tokenizer_file)
+            .map_err(|e| anyhow::anyhow!("Erreur chargement tokenizer: {}", e))?,
+    );
+
+    // Client HTTP
+    let client = reqwest::Client::new();
+
+    // Index
     let index = load_index(&index_file);
     info!("Index chargé: {} chunks", index.chunks.len());
 
-    // État partagé
     let app_state = Arc::new(AppState {
-        engines: Mutex::new(engines),
+        client,
+        ort_session: Mutex::new(ort_session),
+        tokenizer,
         index: Mutex::new(index),
         doc_folder: PathBuf::from(doc_folder),
         index_file,
     });
 
-    // Routes
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/query", post(query))
         .route("/reindex", post(reindex))
         .with_state(app_state);
 
-    // Serveur
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
-        .await?;
-    
-    info!("Serveur écoute sur http://0.0.0.0:{}", port);
-    
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+
+    info!("Serveur écoute sur http://0.0.0.0:{}", &port);
+
     axum::serve(listener, app).await?;
-    
+
     Ok(())
 }
