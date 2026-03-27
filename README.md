@@ -268,21 +268,3 @@ MIT
 ---
 
 **Développé avec ❤️ en Rust**
-
-
-
-### Lancer un serveur interrogeant votre modèle, comme ici avec un Llamafile:
-`./phi-3-mini-4k-instruct.Q4_K_M.llamafile --server --port 8081 --nobrowser --n-gpu-layers 0`
-
-###
-
-curl http://localhost:8080/health
-{"status":"ok","message":"Server and LLM ready","source":[]}⏎
-
-curl -X POST http://localhost:8080/reindex
-{"status":"success","message":"3 documents indexés","source":["./docs/effectifs.md","./docs/document.md","./docs/document_2.md"]}⏎  
-
-
-curl -X POST http://localhost:8080/query \
-        -H "Content-Type: application/json" \
-        -d '{"question": "Quels sont les effectifs ?"}'
