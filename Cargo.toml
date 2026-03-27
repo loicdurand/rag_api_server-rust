@@ -1,0 +1,27 @@
+[package]
+name = "rag_api_server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# HTTP Server
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# LLM & Embeddings
+llama-cpp-rs = "0.1"
+ort = { version = "2.0", features = ["download-binaries"] }
+ndarray = "0.15"
+
+# Utils
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-segmentation = "1.10"
+walkdir = "2.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
