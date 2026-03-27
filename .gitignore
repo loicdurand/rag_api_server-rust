@@ -1,3 +1,5 @@
-/target
-/docs/*
-/models/*
+target
+docs/*
+models/*
+rag_index.json
+Cargo.lock
