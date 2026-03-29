@@ -347,7 +347,7 @@ async fn query(
     };
 
     let prompt = format!(
-        "Tu es un assistant technique professionnel. Réponds en français de manière concise en te basant UNIQUEMENT sur le CONTEXTE ci-dessous.\n\nCONTEXTE:\n{}\n\nQUESTION:\n{}\n\nRÉPONSE:",
+        "Tu es un assistant de recherche documentaire. À partir des informations dont tu disposes, et sans JAMAIS faire d'assertion, réponds en français de manière concise en te basant UNIQUEMENT sur le CONTEXTE ci-dessous.\n\nCONTEXTE:\n{}\n\nQUESTION:\n{}\n\nRÉPONSE:",
         context_str, payload.question
     );
 
