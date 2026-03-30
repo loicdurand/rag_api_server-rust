@@ -1,0 +1,37 @@
+[Unit]
+Description=RAG API Server
+Documentation=https://github.com/loicdurand/rag_api_server-rust
+After=network.target
+
+[Service]
+Type=simple
+User=rag-api
+Group=rag-api
+WorkingDirectory=/opt/rag-api-server
+
+# Variables d'environnement
+Environment="RUST_LOG=info"
+Environment="DOC_FOLDER=/opt/rag-api-server/docs"
+Environment="INDEX_FILE=/var/lib/rag-api-server/rag_index.json"
+Environment="EMBED_MODEL=/opt/rag-api-server/models/all-MiniLM-L6-v2.onnx"
+Environment="TOKENIZER=/opt/rag-api-server/models/tokenizer.json"
+Environment="PORT=8080"
+Environment="LLAMAFILE_URL=http://localhost:8081"
+
+# Fichier optionnel pour surcharger les variables ci-dessus
+EnvironmentFile=-/etc/rag-api-server/env
+
+ExecStart=/usr/bin/rag-api-server
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Durcissement
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rag-api-server
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

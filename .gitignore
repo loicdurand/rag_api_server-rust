@@ -4,3 +4,5 @@ models/*
 rag_index.json
 Cargo.lock
 llama.log
+*.tar.gz
+*.zip

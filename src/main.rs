@@ -372,6 +372,8 @@ async fn query(
         Err(_) => "Erreur de génération".to_string(),
     };
 
+    // on supprime l'indication "\n<end_of_turn>" à la fin de answer
+    let answer = answer.replace("\n<end_of_turn>", "");
     Ok(Json(QueryResponse {
         status: "success".to_string(),
         data: answer,

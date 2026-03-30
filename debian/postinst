@@ -1,0 +1,72 @@
+#!/bin/sh
+set -e
+
+USER="rag-api"
+GROUP="rag-api"
+OPT_DIR="/opt/rag-api-server"
+VAR_DIR="/var/lib/rag-api-server"
+CONF_DIR="/etc/rag-api-server"
+
+case "$1" in
+    configure)
+        # Créer le groupe système si inexistant
+        if ! getent group "$GROUP" > /dev/null 2>&1; then
+            addgroup --system "$GROUP"
+        fi
+
+        # Créer l'utilisateur système si inexistant
+        if ! getent passwd "$USER" > /dev/null 2>&1; then
+            adduser --system \
+                    --ingroup "$GROUP" \
+                    --home "$OPT_DIR" \
+                    --no-create-home \
+                    --disabled-password \
+                    --gecos "RAG API Server" \
+                    "$USER"
+        fi
+
+        # Créer les répertoires nécessaires
+        install -d -m 0755 -o "$USER" -g "$GROUP" "$OPT_DIR"
+        install -d -m 0755 -o "$USER" -g "$GROUP" "$OPT_DIR/docs"
+        install -d -m 0755 -o "$USER" -g "$GROUP" "$OPT_DIR/models"
+        install -d -m 0755 -o "$USER" -g "$GROUP" "$VAR_DIR"
+        install -d -m 0755 -o root   -g root      "$CONF_DIR"
+
+        # Créer le fichier d'environnement s'il n'existe pas encore
+        if [ ! -f "$CONF_DIR/env" ]; then
+            cat > "$CONF_DIR/env" <<'EOF'
+# Surcharge des variables d'environnement du service RAG API Server.
+# Décommentez et modifiez les lignes souhaitées, puis relancez :
+#   sudo systemctl restart rag-api-server
+
+# DOC_FOLDER=/opt/rag-api-server/docs
+# INDEX_FILE=/var/lib/rag-api-server/rag_index.json
+# EMBED_MODEL=/opt/rag-api-server/models/all-MiniLM-L6-v2.onnx
+# TOKENIZER=/opt/rag-api-server/models/tokenizer.json
+# PORT=8080
+# LLAMAFILE_URL=http://localhost:8081
+# RUST_LOG=info
+EOF
+            chmod 0640 "$CONF_DIR/env"
+            chown root:"$GROUP" "$CONF_DIR/env"
+        fi
+
+        echo ""
+        echo "NOTE: Le service rag-api-server a été activé mais pas démarré."
+        echo "Installez d'abord les modèles dans $OPT_DIR/models/, puis :"
+        echo "  sudo systemctl start rag-api-server"
+        echo ""
+    ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+
+    *)
+        echo "postinst appelé avec argument inconnu : '$1'" >&2
+        exit 1
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0

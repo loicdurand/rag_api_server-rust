@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|deconfigure)
+    ;;
+
+    upgrade|failed-upgrade)
+    ;;
+
+    *)
+        echo "prerm appelé avec argument inconnu : '$1'" >&2
+        exit 1
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0

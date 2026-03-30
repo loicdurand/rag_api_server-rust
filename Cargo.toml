@@ -2,6 +2,12 @@
 name = "rag_api_server"
 version = "0.1.0"
 edition = "2021"
+description = "Serveur API RAG (Retrieval-Augmented Generation) local, écrit en Rust"
+license = "MIT"
+authors = ["Loic Durand"]
+homepage = "https://github.com/loicdurand/rag_api_server-rust"
+repository = "https://github.com/loicdurand/rag_api_server-rust"
+keywords = ["rag", "llm", "api", "embeddings", "onnx"]
 
 [dependencies]
 # HTTP Server
@@ -27,3 +33,33 @@ tokenizers = "0.22.2"
 [profile.release]
 lto = true
 codegen-units = 1
+strip = true
+
+# ─── PACKAGING .DEB ────────────────────────────────────────────────────────────
+# Prérequis : cargo install cargo-deb
+# Utilisation : cargo deb
+# Le .deb sera généré dans target/debian/
+# ────────────────────────────────────────────────────────────────────────────────
+[package.metadata.deb]
+name = "rag-api-server"
+maintainer = "Loic Durand <loic@example.com>"
+copyright = "2024, Loic Durand <loic@example.com>"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Serveur API REST RAG (Retrieval-Augmented Generation) haute performance.
+Combine recherche vectorielle (ONNX / all-MiniLM-L6-v2) et génération
+de texte via un LLM local (Llamafile) pour interroger vos documents
+Markdown en langage naturel. 100 % local, aucune donnée externe."""
+depends = "libstdc++6 (>= 12), libssl3 (>= 3.0), libgcc-s1 (>= 12), adduser"
+section = "net"
+priority = "optional"
+# Répertoire d'installation de l'exécutable
+# cargo-deb renomme automatiquement le binaire selon `name` ci-dessus
+assets = [
+    # [source, destination, permissions]
+    ["target/release/rag_api_server", "usr/bin/rag-api-server",                       "755"],
+    ["debian/rag-api-server.service", "lib/systemd/system/rag-api-server.service",    "644"],
+    ["README.md",                     "usr/share/doc/rag-api-server/README.md",        "644"],
+]
+maintainer-scripts = "debian/"
+systemd-units = { unit-name = "rag-api-server", enable = true, start = false }

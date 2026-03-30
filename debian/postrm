@@ -1,0 +1,46 @@
+#!/bin/sh
+set -e
+
+USER="rag-api"
+GROUP="rag-api"
+OPT_DIR="/opt/rag-api-server"
+VAR_DIR="/var/lib/rag-api-server"
+CONF_DIR="/etc/rag-api-server"
+
+case "$1" in
+    purge)
+        # Supprimer l'utilisateur système
+        if getent passwd "$USER" > /dev/null 2>&1; then
+            deluser --system "$USER" || true
+        fi
+
+        # Supprimer le groupe système
+        if getent group "$GROUP" > /dev/null 2>&1; then
+            delgroup --system "$GROUP" || true
+        fi
+
+        # Supprimer les répertoires de données et de configuration
+        rm -rf "$VAR_DIR"
+        rm -rf "$CONF_DIR"
+
+        # Ne pas supprimer $OPT_DIR car l'utilisateur y a peut-être placé ses modèles
+        # et ses documents. On supprime uniquement ce qu'on a créé.
+        if [ -d "$OPT_DIR" ]; then
+            echo "NOTE: Le répertoire $OPT_DIR n'a pas été supprimé."
+            echo "Supprimez-le manuellement si vous n'en avez plus besoin :"
+            echo "  sudo rm -rf $OPT_DIR"
+        fi
+    ;;
+
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+    ;;
+
+    *)
+        echo "postrm appelé avec argument inconnu : '$1'" >&2
+        exit 1
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0
